@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Squawk — Deal Flow Tracker</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">🐦 Squawk</div>
+    <span class="tagline">Deal flow tracker</span>
+  </div>
+  <div class="header-right">
+    <span class="conn-status" id="connStatus">Not connected</span>
+    <button class="btn btn-sm" id="authBtn" onclick="startAuth()">Connect Google</button>
+    <button class="btn btn-sm btn-primary" id="syncBtn" onclick="syncSheet()" disabled>Sync sheet</button>
+  </div>
+</div>
+
+<div id="setupPanel" class="setup-panel">
+  <div class="setup-card">
+    <h2>Welcome to Squawk</h2>
+    <p>Connect your Google account to load your deal flow sources and sync them to Calendar.</p>
+    <div class="form-row">
+      <label>Google Sheet URL</label>
+      <input type="text" id="sheetUrlInput" placeholder="https://docs.google.com/spreadsheets/d/..." />
+    </div>
+    <div class="form-row">
+      <label>OAuth Client ID</label>
+      <input type="text" id="clientIdInput" placeholder="xxxx.apps.googleusercontent.com" />
+    </div>
+    <div class="setup-actions">
+      <button class="btn btn-primary" onclick="startAuth()">Connect Google</button>
+      <button class="btn" onclick="loadDemo()">Load demo data</button>
+    </div>
+    <div class="setup-note">
+      Your Client ID and Sheet URL are saved in your browser only — never sent anywhere else.
+    </div>
+  </div>
+</div>
+
+<div id="appPanel" class="app-panel hidden">
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('dashboard')">Dashboard</button>
+    <button class="tab" onclick="switchTab('calendar')">Calendar</button>
+    <button class="tab" onclick="switchTab('agent')">AI Agent</button>
+  </div>
+
+  <div class="tab-content active" id="tab-dashboard">
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">Total sources</div><div class="stat-value" id="statTotal">—</div></div>
+      <div class="stat-card"><div class="stat-label">Urgent (≤7 days)</div><div class="stat-value urgent" id="statUrgent">—</div></div>
+      <div class="stat-card"><div class="stat-label">Opening soon (≤30 days)</div><div class="stat-value soon" id="statSoon">—</div></div>
+      <div class="stat-card"><div class="stat-label">Added to Calendar</div><div class="stat-value ok" id="statAdded">0</div></div>
+    </div>
+    <div class="controls">
+      <input type="text" id="searchInput" placeholder="Search sources..." oninput="renderSources()" />
+      <select id="filterType" onchange="renderSources()">
+        <option value="">All types</option>
+        <option value="accelerator">Accelerator</option>
+        <option value="fellowship">Fellowship</option>
+        <option value="competition">Competition</option>
+        <option value="grant">Grant</option>
+        <option value="event">Event</option>
+        <option value="vc">VC</option>
+      </select>
+      <select id="filterUrgency" onchange="renderSources()">
+        <option value="">All timing</option>
+        <option value="urgent">Urgent (≤7d)</option>
+        <option value="soon">Soon (≤30d)</option>
+        <option value="unknown">Date unknown</option>
+      </select>
+      <div class="spacer"></div>
+      <button class="btn btn-sm" id="exportIcsBtn" onclick="exportIcs()">Export .ics</button>
+      <button class="btn btn-sm btn-primary" id="addAllBtn" onclick="addAllToCalendar()" disabled>Add all to Calendar</button>
+    </div>
+    <div class="section-title" id="listTitle">Sources</div>
+    <div class="source-list" id="sourceList">
+      <div class="empty-state">Connect Google or load demo data to see your deal flow sources.</div>
+    </div>
+  </div>
+
+  <div class="tab-content" id="tab-calendar">
+    <div class="calendar-card">
+      <div class="cal-header">
+        <button class="cal-nav" onclick="prevMonth()">&#8249;</button>
+        <div class="cal-title" id="calTitle"></div>
+        <button class="cal-nav" onclick="nextMonth()">&#8250;</button>
+      </div>
+      <div class="cal-grid" id="calGrid"></div>
+    </div>
+  </div>
+
+  <div class="tab-content" id="tab-agent">
+    <div class="agent-card">
+      <div class="agent-icon">🔍</div>
+      <div class="agent-body">
+        <h3>Parse &amp; enrich sources</h3>
+        <p>The AI reads your sources, estimates cohort opening windows, assigns urgency levels, and surfaces key insights.</p>
+        <button class="btn btn-primary" id="parseBtn" onclick="runParseAgent()">Run agent</button>
+        <div class="agent-result" id="parseResult"></div>
+      </div>
+    </div>
+    <div class="agent-card">
+      <div class="agent-icon">🌐</div>
+      <div class="agent-body">
+        <h3>Find new deal flow sources</h3>
+        <p>The AI searches for accelerators, fellowships, competitions, and grants you might be missing, focused on UK/EU.</p>
+        <button class="btn btn-primary" id="discoverBtn" onclick="runDiscoverAgent()">Find new sources</button>
+        <div class="agent-result" id="discoverResult"></div>
+      </div>
+    </div>
+    <div class="agent-card">
+      <div class="agent-icon">📧</div>
+      <div class="agent-body">
+        <h3>Weekly digest email</h3>
+        <p>Generate a clean summary of upcoming deal flow sources to share with your team.</p>
+        <button class="btn btn-primary" id="digestBtn" onclick="runDigestAgent()">Generate digest</button>
+        <div class="agent-result" id="digestResult"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast hidden" id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>
