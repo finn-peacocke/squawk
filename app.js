@@ -1,6 +1,5 @@
 // ── Constants ──────────────────────────────────────────────────────────────
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets.readonly https://www.googleapis.com/auth/calendar.events';
-const CLAUDE_API = 'https://api.anthropic.com/v1/messages';
 const STORAGE_KEY = 'squawk_config';
 
 // ── State ──────────────────────────────────────────────────────────────────
@@ -65,7 +64,7 @@ function onAuthenticated() {
   document.getElementById('syncBtn').disabled = false;
   document.getElementById('addAllBtn').disabled = false;
   showApp();
-  loadSheet();
+  loadAllSheets();
 }
 
 function showApp() {
@@ -74,96 +73,162 @@ function showApp() {
 }
 
 function syncSheet() {
-  if (sheetId && accessToken) loadSheet();
+  if (sheetId && accessToken) loadAllSheets();
 }
 
-// ── Sheet ──────────────────────────────────────────────────────────────────
 function extractSheetId(url) {
   const m = url.match(/\/d\/([a-zA-Z0-9-_]+)/);
   return m ? m[1] : null;
 }
 
-async function loadSheet() {
-  showToast('Loading sheet...');
+// ── Multi-sheet loader ─────────────────────────────────────────────────────
+async function loadAllSheets() {
+  showToast('Loading all sheet tabs...');
+  sources = [];
+
   try {
-    const res = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/A1:Z500`,
+    // Get spreadsheet metadata to find all tab names
+    const metaRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`,
       { headers: { Authorization: 'Bearer ' + accessToken } }
     );
-    const data = await res.json();
-    if (data.error) { showToast('Sheet error: ' + data.error.message); return; }
-    parseSheetData(data.values || []);
-    showToast(`Loaded ${sources.length} sources`);
+    const meta = await metaRes.json();
+    if (meta.error) { showToast('Error: ' + meta.error.message); return; }
+
+    const sheets = meta.sheets || [];
+    showToast(`Found ${sheets.length} tabs — loading all...`);
+
+    // Load each tab in parallel
+    const results = await Promise.all(
+      sheets.map(sh => loadSingleSheet(sh.properties.title))
+    );
+
+    // Merge and assign unique IDs
+    let id = 0;
+    results.forEach(rows => rows.forEach(s => { s.id = id++; sources.push(s); }));
+
+    showToast(`Loaded ${sources.length} sources across ${sheets.length} tabs`);
     renderAll();
+
   } catch (e) {
-    showToast('Failed to load sheet: ' + e.message);
+    showToast('Failed to load sheets: ' + e.message);
   }
 }
 
-function parseSheetData(rows) {
-  if (!rows.length) return;
+async function loadSingleSheet(sheetName) {
+  try {
+    const encoded = encodeURIComponent(sheetName);
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encoded}!A1:Z500`,
+      { headers: { Authorization: 'Bearer ' + accessToken } }
+    );
+    const data = await res.json();
+    if (data.error || !data.values || data.values.length < 2) return [];
+    return parseTab(data.values, sheetName);
+  } catch {
+    return [];
+  }
+}
+
+// ── Per-tab parser ─────────────────────────────────────────────────────────
+function parseTab(rows, tabName) {
+  const isEventsTab = tabName.toLowerCase().includes('event');
+  return isEventsTab ? parseEventsTab(rows, tabName) : parseStandardTab(rows, tabName);
+}
+
+// Standard tabs: Col A = Name, Col B = Link (+ any extra columns)
+function parseStandardTab(rows, tabName) {
   const headers = rows[0].map(h => (h || '').toLowerCase().trim());
 
-  const col = (keywords) => headers.findIndex(h => keywords.some(k => h.includes(k)));
-  const nameIdx    = col(['name', 'source', 'programme', 'program', 'organisation', 'organization']);
-  const urlIdx     = col(['url', 'link', 'website', 'http']);
-  const typeIdx    = col(['type', 'category']);
-  const dateIdx    = col(['date', 'deadline', 'open', 'cohort', 'start', 'launch']);
-  const notesIdx   = col(['note', 'description', 'detail', 'comment']);
+  const nameIdx  = Math.max(0, headers.findIndex(h => h.includes('name') || h.includes('source') || h.includes('programme') || h.includes('program') || h.includes('organisation')));
+  const urlIdx   = headers.findIndex(h => h.includes('link') || h.includes('url') || h.includes('website') || h.includes('http'));
+  const dateIdx  = headers.findIndex(h => h.includes('date') || h.includes('deadline') || h.includes('cohort') || h.includes('open') || h.includes('launch'));
+  const notesIdx = headers.findIndex(h => h.includes('note') || h.includes('description') || h.includes('detail') || h.includes('focus') || h.includes('priority'));
 
-  sources = rows.slice(1)
-    .filter(r => r.some(c => c && c.trim()))
-    .map((row, i) => {
-      const name    = (nameIdx >= 0 ? row[nameIdx] : row[0]) || '';
-      const url     = (urlIdx >= 0 ? row[urlIdx] : findUrl(row)) || '';
-      const type    = typeIdx >= 0 ? normaliseType(row[typeIdx]) : guessType(name, url);
-      const rawDate = (dateIdx >= 0 ? row[dateIdx] : '') || '';
-      const notes   = (notesIdx >= 0 ? row[notesIdx] : '') || '';
+  // Default: name=col0, link=col1 if not found in headers
+  const resolvedUrlIdx = urlIdx >= 0 ? urlIdx : 1;
+
+  const tabType = guessTypeFromTab(tabName);
+
+  return rows.slice(1)
+    .filter(r => r[nameIdx] && (r[nameIdx] || '').trim())
+    .map(row => {
+      const name       = (row[nameIdx] || '').trim();
+      const url        = (row[resolvedUrlIdx] || findUrl(row) || '').trim();
+      const rawDate    = dateIdx >= 0 ? (row[dateIdx] || '').trim() : '';
+      const notes      = notesIdx >= 0 ? (row[notesIdx] || '').trim() : '';
+      const type       = guessType(name, url, tabType);
       const parsedDate = parseDate(rawDate);
-      const urgency = getUrgency(parsedDate);
-      return { id: i, name: name.trim(), url: url.trim(), type, rawDate, parsedDate, notes: notes.trim(), urgency };
-    })
-    .filter(s => s.name);
+      const urgency    = getUrgency(parsedDate);
+      return { name, url, type, rawDate, parsedDate, notes, urgency, tab: tabName };
+    });
+}
+
+// Events tab: Col A=Start Date, Col B=End Date, Col C=Event Name,
+//             Col D=Location, Col E=Focus, Col F=Priority
+function parseEventsTab(rows, tabName) {
+  return rows.slice(1)
+    .filter(r => r[2] && (r[2] || '').trim())
+    .map(row => {
+      const rawDate    = (row[0] || '').trim();
+      const rawEndDate = (row[1] || '').trim();
+      const name       = (row[2] || '').trim();
+      const location   = (row[3] || '').trim();
+      const focus      = (row[4] || '').trim();
+      const priority   = (row[5] || '').trim();
+      const parsedDate = parseDate(rawDate);
+      const urgency    = getUrgency(parsedDate);
+      const notes      = [location, focus, priority].filter(Boolean).join(' · ');
+      return { name, url: '', type: 'event', rawDate, rawEndDate, parsedDate, notes, urgency, tab: tabName };
+    });
+}
+
+function guessTypeFromTab(tabName) {
+  const t = tabName.toLowerCase();
+  if (t.includes('accelerat')) return 'accelerator';
+  if (t.includes('fellow')) return 'fellowship';
+  if (t.includes('compet') || t.includes('award') || t.includes('prize') || t.includes('hack')) return 'competition';
+  if (t.includes('grant') || t.includes('fund')) return 'grant';
+  if (t.includes('event')) return 'event';
+  if (t.includes('vc') || t.includes('venture') || t.includes('invest')) return 'vc';
+  return null;
+}
+
+function guessType(name, url, tabType) {
+  if (tabType) return tabType;
+  const txt = (name + url).toLowerCase();
+  if (txt.includes('accelerat') || txt.includes('techstars') || txt.includes('bootcamp') || txt.includes('y combinator')) return 'accelerator';
+  if (txt.includes('fellow')) return 'fellowship';
+  if (txt.includes('compet') || txt.includes('award') || txt.includes('prize') || txt.includes('hackathon')) return 'competition';
+  if (txt.includes('grant') || txt.includes('fund') || txt.includes('innovate uk')) return 'grant';
+  if (txt.includes('event') || txt.includes('summit') || txt.includes('conf') || txt.includes('demo day')) return 'event';
+  if (txt.includes('vc') || txt.includes('venture')) return 'vc';
+  return 'accelerator';
 }
 
 function findUrl(row) {
   return row.find(c => c && (c.startsWith('http://') || c.startsWith('https://'))) || '';
 }
 
-function normaliseType(t) {
-  if (!t) return 'other';
-  t = t.toLowerCase();
-  if (t.includes('accelerat')) return 'accelerator';
-  if (t.includes('fellow')) return 'fellowship';
-  if (t.includes('compet') || t.includes('award') || t.includes('prize') || t.includes('hack')) return 'competition';
-  if (t.includes('grant') || t.includes('fund')) return 'grant';
-  if (t.includes('event') || t.includes('summit') || t.includes('conf') || t.includes('demo day')) return 'event';
-  if (t.includes('vc') || t.includes('venture') || t.includes('invest')) return 'vc';
-  return 'other';
-}
-
-function guessType(name, url) {
-  const txt = (name + url).toLowerCase();
-  if (txt.includes('accelerat') || txt.includes('y combinator') || txt.includes('techstars') || txt.includes('bootcamp')) return 'accelerator';
-  if (txt.includes('fellow')) return 'fellowship';
-  if (txt.includes('compet') || txt.includes('award') || txt.includes('prize') || txt.includes('hackathon')) return 'competition';
-  if (txt.includes('grant')) return 'grant';
-  if (txt.includes('event') || txt.includes('summit') || txt.includes('conf') || txt.includes('demo day')) return 'event';
-  if (txt.includes('vc') || txt.includes('venture') || txt.includes('fund')) return 'vc';
-  return 'accelerator';
-}
-
 function parseDate(str) {
   if (!str) return null;
-  const d = new Date(str);
+  const cleaned = str.trim();
+  // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
+  const dmy = cleaned.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})$/);
+  if (dmy) {
+    const year = dmy[3].length === 2 ? '20' + dmy[3] : dmy[3];
+    const d = new Date(`${year}-${dmy[2].padStart(2,'0')}-${dmy[1].padStart(2,'0')}`);
+    if (!isNaN(d.getTime())) return d;
+  }
+  const d = new Date(cleaned);
   return isNaN(d.getTime()) ? null : d;
 }
 
 function getUrgency(date) {
   if (!date) return 'unknown';
   const diff = Math.ceil((date - now) / 86400000);
-  if (diff < 0) return 'past';
-  if (diff <= 7) return 'urgent';
+  if (diff < 0)   return 'past';
+  if (diff <= 7)  return 'urgent';
   if (diff <= 30) return 'soon';
   return 'ok';
 }
@@ -189,7 +254,11 @@ function renderSources() {
   const urgencyF = document.getElementById('filterUrgency').value;
 
   let filtered = sources.filter(s => s.urgency !== 'past');
-  if (search)   filtered = filtered.filter(s => s.name.toLowerCase().includes(search) || s.url.toLowerCase().includes(search));
+  if (search)   filtered = filtered.filter(s =>
+    s.name.toLowerCase().includes(search) ||
+    (s.url || '').toLowerCase().includes(search) ||
+    (s.tab || '').toLowerCase().includes(search)
+  );
   if (typeF)    filtered = filtered.filter(s => s.type === typeF);
   if (urgencyF) filtered = filtered.filter(s => s.urgency === urgencyF);
 
@@ -205,7 +274,7 @@ function renderSources() {
   }
 
   list.innerHTML = filtered.map(s => {
-    const cardClass = addedIds.has(s.id) ? 'added' : s.urgency;
+    const cardClass  = addedIds.has(s.id) ? 'added' : s.urgency;
     const badgeClass = addedIds.has(s.id) ? 'added' : s.urgency;
     return `
     <div class="source-card ${cardClass}">
@@ -213,12 +282,14 @@ function renderSources() {
       <div class="source-body">
         <div class="source-name">${esc(s.name)}</div>
         <div class="source-meta">
-          ${s.url ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${shortUrl(s.url)}</a>` : 'No URL'}
+          ${s.url ? `<a href="${esc(s.url)}" target="_blank" rel="noopener">${shortUrl(s.url)}</a>` : ''}
+          ${s.url && s.tab ? ' · ' : ''}
+          ${s.tab ? `<span style="color:#bbb">${esc(s.tab)}</span>` : ''}
           ${s.rawDate ? ' · ' + esc(s.rawDate) : ''}
         </div>
         <div class="source-tags">
           <span class="tag type-${s.type}">${s.type}</span>
-          ${s.notes ? `<span class="tag">${esc(s.notes.substring(0, 50))}</span>` : ''}
+          ${s.notes ? `<span class="tag">${esc(s.notes.substring(0, 60))}</span>` : ''}
         </div>
       </div>
       <div class="source-actions">
@@ -238,7 +309,7 @@ function typeEmoji(type) {
 function daysLabel(s) {
   if (!s.parsedDate) return 'Date unknown';
   const diff = Math.ceil((s.parsedDate - now) / 86400000);
-  if (diff < 0)  return 'Passed';
+  if (diff < 0)   return 'Passed';
   if (diff === 0) return 'Today';
   if (diff === 1) return 'Tomorrow';
   return `In ${diff} days`;
@@ -277,18 +348,18 @@ function renderCalendar() {
   }
 
   for (let d = 1; d <= daysInMonth; d++) {
-    const cell      = document.createElement('div');
-    const thisDate  = new Date(calYear, calMonth, d);
-    const isToday   = thisDate.toDateString() === now.toDateString();
-    cell.className  = 'cal-cell' + (isToday ? ' today' : '');
-    cell.innerHTML  = `<div class="cal-date">${d}</div>`;
+    const cell     = document.createElement('div');
+    const thisDate = new Date(calYear, calMonth, d);
+    const isToday  = thisDate.toDateString() === now.toDateString();
+    cell.className = 'cal-cell' + (isToday ? ' today' : '');
+    cell.innerHTML = `<div class="cal-date">${d}</div>`;
 
     const dayEvents = sources.filter(s => s.parsedDate && s.parsedDate.toDateString() === thisDate.toDateString());
     dayEvents.slice(0, 3).forEach(s => {
       const ev = document.createElement('div');
       ev.className = 'cal-event ' + (s.urgency === 'urgent' ? 'urgent' : s.urgency === 'soon' ? 'soon' : 'ok');
       ev.textContent = s.name;
-      ev.title = s.name;
+      ev.title = s.name + (s.tab ? ' (' + s.tab + ')' : '');
       cell.appendChild(ev);
     });
     if (dayEvents.length > 3) {
@@ -319,11 +390,11 @@ async function addToCalendar(id) {
   if (!s) return;
 
   const start = s.parsedDate || new Date(now.getTime() + 7 * 86400000);
-  const end   = new Date(start.getTime() + 3600000);
+  const end   = s.rawEndDate ? (parseDate(s.rawEndDate) || new Date(start.getTime() + 3600000)) : new Date(start.getTime() + 3600000);
 
   const event = {
     summary: `[Squawk] ${s.name}`,
-    description: `Type: ${s.type}\nSource: ${s.url}\n${s.notes ? 'Notes: ' + s.notes : ''}`.trim(),
+    description: [`Type: ${s.type}`, `Tab: ${s.tab || ''}`, s.url ? `URL: ${s.url}` : '', s.notes ? `Notes: ${s.notes}` : ''].filter(Boolean).join('\n'),
     start: { dateTime: start.toISOString() },
     end:   { dateTime: end.toISOString() },
     reminders: {
@@ -359,7 +430,7 @@ async function addAllToCalendar() {
   showToast(`Adding ${toAdd.length} sources to Calendar...`);
   for (const s of toAdd) {
     await addToCalendar(s.id);
-    await sleep(250);
+    await sleep(300);
   }
   showToast('All sources added to Calendar.');
 }
@@ -373,7 +444,7 @@ function exportIcs() {
 
   active.forEach(s => {
     const start = s.parsedDate || new Date(now.getTime() + 7 * 86400000);
-    const end   = new Date(start.getTime() + 3600000);
+    const end   = s.rawEndDate ? (parseDate(s.rawEndDate) || new Date(start.getTime() + 3600000)) : new Date(start.getTime() + 3600000);
     const fmt   = d => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
     lines.push(
       'BEGIN:VEVENT',
@@ -381,7 +452,7 @@ function exportIcs() {
       `DTSTART:${fmt(start)}`,
       `DTEND:${fmt(end)}`,
       `SUMMARY:[Squawk] ${s.name}`,
-      `DESCRIPTION:Type: ${s.type}\\nURL: ${s.url}\\n${s.notes}`,
+      `DESCRIPTION:Type: ${s.type}\\nTab: ${s.tab || ''}\\nURL: ${s.url || ''}\\n${s.notes || ''}`,
       'BEGIN:VALARM', 'TRIGGER:-P7D', 'ACTION:DISPLAY', `DESCRIPTION:Reminder: ${s.name}`, 'END:VALARM',
       'END:VEVENT'
     );
@@ -400,39 +471,42 @@ function exportIcs() {
 function loadDemo() {
   const future = (days) => new Date(now.getTime() + days * 86400000);
   sources = [
-    { id: 0,  name: 'ConceptionX Cohort 8',          url: 'https://conceptionx.org',                                      type: 'accelerator',  rawDate: future(18).toDateString(),  parsedDate: future(18),  notes: 'Deep tech, university spinouts', urgency: 'soon' },
-    { id: 1,  name: 'Activate Fellows Program',       url: 'https://activate.org',                                         type: 'fellowship',   rawDate: future(5).toDateString(),   parsedDate: future(5),   notes: 'Science entrepreneurs',          urgency: 'urgent' },
-    { id: 2,  name: 'Entrepreneur First London',      url: 'https://www.joinef.com',                                       type: 'accelerator',  rawDate: future(35).toDateString(),  parsedDate: future(35),  notes: 'Pre-team, pre-idea',              urgency: 'ok' },
-    { id: 3,  name: 'Innovate UK Smart Grants',       url: 'https://www.ukri.org/councils/innovate-uk/',                   type: 'grant',        rawDate: '',                         parsedDate: null,        notes: 'Rolling deadlines',               urgency: 'unknown' },
-    { id: 4,  name: 'SFC MedTech Accelerator',        url: 'https://www.sfcollective.com',                                 type: 'accelerator',  rawDate: future(60).toDateString(),  parsedDate: future(60),  notes: 'MedTech focus',                   urgency: 'ok' },
-    { id: 5,  name: 'UKRI Future Leaders Fellowships',url: 'https://www.ukri.org/apply-for-funding/future-leaders-fellowships/', type: 'fellowship', rawDate: future(28).toDateString(), parsedDate: future(28), notes: 'Academic spinouts',             urgency: 'soon' },
-    { id: 6,  name: 'Startupbootcamp FinTech',        url: 'https://www.startupbootcamp.org',                              type: 'accelerator',  rawDate: future(6).toDateString(),   parsedDate: future(6),   notes: 'London-based',                    urgency: 'urgent' },
-    { id: 7,  name: 'MIT Climate & Energy Prize',     url: 'https://cep.mit.edu',                                          type: 'competition',  rawDate: future(22).toDateString(),  parsedDate: future(22),  notes: '$100k+ prize',                    urgency: 'soon' },
-    { id: 8,  name: 'Seedcamp',                       url: 'https://seedcamp.com',                                         type: 'vc',           rawDate: '',                         parsedDate: null,        notes: 'Rolling applications',            urgency: 'unknown' },
-    { id: 9,  name: 'Hello Tomorrow Summit',          url: 'https://hellotomorrow.global',                                 type: 'event',        rawDate: future(90).toDateString(),  parsedDate: future(90),  notes: 'Deep tech, Paris',                urgency: 'ok' },
+    { id: 0, name: 'ConceptionX Cohort 8',            url: 'https://conceptionx.org',         type: 'accelerator', rawDate: future(18).toDateString(), parsedDate: future(18), notes: 'Deep tech, university spinouts', urgency: 'soon',    tab: 'UK' },
+    { id: 1, name: 'Activate Fellows Program',         url: 'https://activate.org',            type: 'fellowship',  rawDate: future(5).toDateString(),  parsedDate: future(5),  notes: 'Science entrepreneurs',          urgency: 'urgent',  tab: 'US' },
+    { id: 2, name: 'Entrepreneur First London',        url: 'https://www.joinef.com',          type: 'accelerator', rawDate: future(35).toDateString(), parsedDate: future(35), notes: 'Pre-team, pre-idea',              urgency: 'ok',      tab: 'UK' },
+    { id: 3, name: 'Innovate UK Smart Grants',         url: 'https://www.ukri.org',            type: 'grant',       rawDate: '',                        parsedDate: null,       notes: 'Rolling deadlines',               urgency: 'unknown', tab: 'UK' },
+    { id: 4, name: 'Hello Tomorrow Summit',            url: 'https://hellotomorrow.global',    type: 'event',       rawDate: future(45).toDateString(), parsedDate: future(45), notes: 'Paris · Deep tech · High',        urgency: 'ok',      tab: 'Events' },
+    { id: 5, name: 'UKRI Future Leaders Fellowships',  url: 'https://www.ukri.org',            type: 'fellowship',  rawDate: future(28).toDateString(), parsedDate: future(28), notes: 'Academic spinouts',               urgency: 'soon',    tab: 'UK' },
+    { id: 6, name: 'Startupbootcamp FinTech',          url: 'https://startupbootcamp.org',     type: 'accelerator', rawDate: future(6).toDateString(),  parsedDate: future(6),  notes: 'London-based',                    urgency: 'urgent',  tab: 'EU' },
+    { id: 7, name: 'MIT Climate & Energy Prize',       url: 'https://cep.mit.edu',             type: 'competition', rawDate: future(22).toDateString(), parsedDate: future(22), notes: '$100k+ prize',                    urgency: 'soon',    tab: 'US' },
+    { id: 8, name: 'Seedcamp',                         url: 'https://seedcamp.com',            type: 'vc',          rawDate: '',                        parsedDate: null,       notes: 'Rolling applications',            urgency: 'unknown', tab: 'EU' },
+    { id: 9, name: 'Web Summit Lisbon',                url: 'https://websummit.com',           type: 'event',       rawDate: future(90).toDateString(), parsedDate: future(90), notes: 'Lisbon · Tech · High',            urgency: 'ok',      tab: 'Events' },
   ];
-
-  document.getElementById('connStatus').textContent  = 'Demo mode';
-  document.getElementById('connStatus').className    = 'conn-status demo';
-  document.getElementById('exportIcsBtn').disabled   = false;
+  document.getElementById('connStatus').textContent = 'Demo mode';
+  document.getElementById('connStatus').className   = 'conn-status demo';
   showApp();
   renderAll();
-  showToast('Demo data loaded — 10 sample sources');
+  showToast('Demo data loaded — 10 sources across 4 tabs');
 }
 
 // ── AI Agents ──────────────────────────────────────────────────────────────
 async function callClaude(system, user, btnId, resultId) {
-  const btn = document.getElementById(btnId);
-  const result = document.getElementById(resultId);
+  const btn      = document.getElementById(btnId);
+  const result   = document.getElementById(resultId);
   const origText = btn.textContent;
-  btn.disabled = true;
+  btn.disabled    = true;
   btn.textContent = 'Running...';
   result.style.display = 'none';
 
   try {
-    const res = await fetch(CLAUDE_API, {
+    // Direct call with the browser-access header — works from a proper https origin like GitHub Pages
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1000,
@@ -440,35 +514,39 @@ async function callClaude(system, user, btnId, resultId) {
         messages: [{ role: 'user', content: user }]
       })
     });
+
     const data = await res.json();
-    const text = data.content?.[0]?.text || 'No response received.';
-    result.textContent = text;
+    if (data.error) throw new Error(data.error.message);
+    result.textContent = data.content?.[0]?.text || 'No response received.';
     result.style.display = 'block';
+
   } catch (e) {
-    result.textContent = 'Error: ' + e.message;
+    result.textContent = 'Could not reach AI — this feature requires an Anthropic API key.\n\nError: ' + e.message;
     result.style.display = 'block';
   }
 
-  btn.disabled = false;
+  btn.disabled    = false;
   btn.textContent = origText;
 }
 
 function runParseAgent() {
   if (!sources.length) { showToast('Load your sheet first.'); return; }
-  const sample = sources.slice(0, 20).map(s => `- ${s.name} | ${s.url || 'no url'} | ${s.rawDate || 'no date'}`).join('\n');
+  const sample = sources.slice(0, 25)
+    .map(s => `- ${s.name} | tab: ${s.tab || 'unknown'} | url: ${s.url || 'none'} | date: ${s.rawDate || 'none'}`)
+    .join('\n');
   callClaude(
     'You are a deal flow analyst for an early-stage investor. Analyse programme sources and provide estimated cohort windows, urgency, and key insights. Be concise and practical.',
-    `Analyse these deal flow sources and for each provide: estimated next opening window, urgency level, and a 1-line insight on why it matters.\n\n${sample}`,
+    `Analyse these deal flow sources. For each provide: estimated next opening window (month/year), urgency (urgent/soon/later), and a 1-line insight on why it matters.\n\n${sample}`,
     'parseBtn', 'parseResult'
   );
 }
 
 function runDiscoverAgent() {
-  const types = [...new Set(sources.map(s => s.type))].join(', ');
-  const names = sources.slice(0, 8).map(s => s.name).join(', ');
+  const tabs  = [...new Set(sources.map(s => s.tab).filter(Boolean))].join(', ');
+  const names = sources.slice(0, 10).map(s => s.name).join(', ');
   callClaude(
     'You are a startup ecosystem researcher specialising in early-stage deal flow for UK/EU investors. You have deep knowledge of accelerators, fellowships, competitions, and grants.',
-    `I track these types of sources: ${types || 'accelerators, fellowships, competitions, grants'}.\nExamples I already track: ${names || 'various programmes'}.\n\nSuggest 10 high-quality deal flow sources I might be missing. For each: name, URL, type, typical cohort timing, and why it is valuable for early-stage deal flow. Prioritise UK/EU but include key global ones.`,
+    `I track deal flow across: ${tabs || 'UK, EU, US'}.\nExamples already tracked: ${names || 'various'}.\n\nSuggest 10 high-quality sources I might be missing. For each: name, URL, type, typical cohort timing, and why it is valuable. Prioritise UK/EU but include key global ones.`,
     'discoverBtn', 'discoverResult'
   );
 }
@@ -477,12 +555,12 @@ function runDigestAgent() {
   if (!sources.length) { showToast('Load your sheet first.'); return; }
   const upcoming = sources
     .filter(s => s.urgency === 'urgent' || s.urgency === 'soon')
-    .map(s => `- ${s.name} (${s.type}) — ${daysLabel(s)} — ${s.url}`)
+    .map(s => `- ${s.name} (${s.type}, ${s.tab || ''}) — ${daysLabel(s)}${s.url ? ' — ' + s.url : ''}`)
     .join('\n');
   const total = sources.filter(s => s.urgency !== 'past').length;
   callClaude(
-    'You are a VC analyst. Write concise, professional weekly deal flow digests for investment teams. Tone: clear, direct, no fluff.',
-    `Write a weekly deal flow digest email. Total sources tracked: ${total}.\n\nUpcoming in the next 30 days:\n${upcoming || 'None with confirmed dates yet.'}\n\nInclude: subject line, brief intro, structured list of opportunities, and recommended actions for this week.`,
+    'You are a VC analyst. Write concise, professional weekly deal flow digest emails. Tone: clear, direct, no fluff.',
+    `Write a weekly deal flow digest. Total tracked: ${total}.\n\nUpcoming (next 30 days):\n${upcoming || 'None with confirmed dates.'}\n\nInclude: subject line, brief intro, structured list grouped by urgency, recommended actions this week.`,
     'digestBtn', 'digestResult'
   );
 }
@@ -504,7 +582,7 @@ function showToast(msg) {
   t.textContent = msg;
   t.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.add('hidden'), 3000);
+  toastTimer = setTimeout(() => t.classList.add('hidden'), 3500);
 }
 
 // ── Utils ──────────────────────────────────────────────────────────────────
