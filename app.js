@@ -7,6 +7,7 @@ let sources = [];
 let addedIds = new Set();
 let accessToken = null;
 let sheetId = null;
+let anthropicKey = null;
 let calYear, calMonth;
 const now = new Date();
 calYear = now.getFullYear();
@@ -17,6 +18,7 @@ window.addEventListener('DOMContentLoaded', () => {
   const saved = loadConfig();
   if (saved.sheetUrl) document.getElementById('sheetUrlInput').value = saved.sheetUrl;
   if (saved.clientId) document.getElementById('clientIdInput').value = saved.clientId;
+  if (saved.anthropicKey) { document.getElementById('anthropicKeyInput').value = saved.anthropicKey; anthropicKey = saved.anthropicKey; }
   renderCalendar();
 });
 
@@ -24,20 +26,21 @@ function loadConfig() {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch { return {}; }
 }
 
-function saveConfig(clientId, sheetUrl) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ clientId, sheetUrl }));
+function saveConfig(clientId, sheetUrl, apiKey) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ clientId, sheetUrl, anthropicKey: apiKey }));
 }
 
 // ── Auth ───────────────────────────────────────────────────────────────────
 function startAuth() {
   const clientId = document.getElementById('clientIdInput').value.trim();
   const sheetUrl = document.getElementById('sheetUrlInput').value.trim();
+  anthropicKey = document.getElementById('anthropicKeyInput').value.trim();
   if (!clientId || !sheetUrl) { showToast('Please enter your Client ID and Sheet URL.'); return; }
 
   sheetId = extractSheetId(sheetUrl);
   if (!sheetId) { showToast('Could not parse Sheet ID from URL.'); return; }
 
-  saveConfig(clientId, sheetUrl);
+  saveConfig(clientId, sheetUrl, anthropicKey);
 
   const gsiScript = document.createElement('script');
   gsiScript.src = 'https://accounts.google.com/gsi/client';
@@ -63,8 +66,19 @@ function onAuthenticated() {
   document.getElementById('authBtn').textContent = 'Reconnect';
   document.getElementById('syncBtn').disabled = false;
   document.getElementById('addAllBtn').disabled = false;
+  document.getElementById('apiKeyBtn').style.display = '';
   showApp();
   loadAllSheets();
+}
+
+function promptApiKey() {
+  const current = anthropicKey || '';
+  const key = prompt('Enter your Anthropic API key (sk-ant-...):', current);
+  if (key === null) return; // cancelled
+  anthropicKey = key.trim();
+  const saved = loadConfig();
+  saveConfig(saved.clientId || '', saved.sheetUrl || '', anthropicKey);
+  showToast(anthropicKey ? 'API key saved.' : 'API key cleared.');
 }
 
 function showApp() {
@@ -497,6 +511,14 @@ async function callClaude(system, user, btnId, resultId) {
   btn.textContent = 'Running...';
   result.style.display = 'none';
 
+  if (!anthropicKey) {
+    result.textContent = 'Please enter your Anthropic API key in the setup screen (click Reconnect in the header).';
+    result.style.display = 'block';
+    btn.disabled = false;
+    btn.textContent = origText;
+    return;
+  }
+
   try {
     // Direct call with the browser-access header — works from a proper https origin like GitHub Pages
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -504,7 +526,8 @@ async function callClaude(system, user, btnId, resultId) {
       headers: {
         'Content-Type': 'application/json',
         'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'x-api-key': anthropicKey || ''
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
@@ -531,11 +554,18 @@ async function callClaude(system, user, btnId, resultId) {
 function runParseAgent() {
   if (!sources.length) { showToast('Load your sheet first.'); return; }
   const sample = sources.slice(0, 25)
-    .map(s => `- ${s.name} | tab: ${s.tab || 'unknown'} | url: ${s.url || 'none'} | date: ${s.rawDate || 'none'}`)
+    .map(s => `- ${s.name} | type: ${s.type} | tab: ${s.tab || 'unknown'} | url: ${s.url || 'none'} | date: ${s.rawDate || 'none'} | notes: ${s.notes || 'none'}`)
     .join('\n');
   callClaude(
-    'You are a deal flow analyst for an early-stage investor. Analyse programme sources and provide estimated cohort windows, urgency, and key insights. Be concise and practical.',
-    `Analyse these deal flow sources. For each provide: estimated next opening window (month/year), urgency (urgent/soon/later), and a 1-line insight on why it matters.\n\n${sample}`,
+    `You are a deal flow analyst for an early-stage investor. Today's date is ${now.toDateString()}.
+Your job is to enrich deal flow sources with:
+1. DATES — next cohort open/close dates, application deadlines, announcement dates. Use your training knowledge of these programmes. If you know exact dates, give them. If not, give a realistic estimate based on historical patterns (e.g. "typically opens March–April").
+2. KEY ATTENDEES / SPEAKERS — for events, name the typical calibre of attendees, notable past speakers, or target audience (e.g. "Series A founders, DeepTech VCs").
+3. URGENCY — urgent (action needed within 7 days), soon (within 30 days), monitor (1–3 months), low (3+ months).
+4. INSIGHT — one sharp sentence on why this matters for early-stage deal flow.
+
+Be direct and specific. Use your knowledge of these programmes — don't be vague.`,
+    `Enrich these deal flow sources. For each, provide: next key date, urgency, key attendees/speakers (if event), and 1-line deal flow insight.\n\nToday: ${now.toDateString()}\n\n${sample}`,
     'parseBtn', 'parseResult'
   );
 }

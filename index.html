@@ -16,6 +16,7 @@
   <div class="header-right">
     <span class="conn-status" id="connStatus">Not connected</span>
     <button class="btn btn-sm" id="authBtn" onclick="startAuth()">Connect Google</button>
+    <button class="btn btn-sm" id="apiKeyBtn" onclick="promptApiKey()" style="display:none">API Key</button>
     <button class="btn btn-sm btn-primary" id="syncBtn" onclick="syncSheet()" disabled>Sync sheet</button>
   </div>
 </div>
@@ -32,12 +33,16 @@
       <label>OAuth Client ID</label>
       <input type="text" id="clientIdInput" placeholder="xxxx.apps.googleusercontent.com" />
     </div>
+    <div class="form-row">
+      <label>Anthropic API Key <span style="font-weight:400;color:#aaa;text-transform:none">(optional — needed for AI agents)</span></label>
+      <input type="password" id="anthropicKeyInput" placeholder="sk-ant-..." autocomplete="off" />
+    </div>
     <div class="setup-actions">
       <button class="btn btn-primary" onclick="startAuth()">Connect Google</button>
       <button class="btn" onclick="loadDemo()">Load demo data</button>
     </div>
     <div class="setup-note">
-      Your Client ID and Sheet URL are saved in your browser only — never sent anywhere else.
+      All credentials are saved in your browser only — never sent to any third party.
     </div>
   </div>
 </div>
