@@ -87,46 +87,45 @@ async function loadAllSheets() {
   sources = [];
 
   try {
-    // Get spreadsheet metadata to find all tab names
+    // Step 1: get metadata to discover all tab names
     const metaRes = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`,
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`,
       { headers: { Authorization: 'Bearer ' + accessToken } }
     );
     const meta = await metaRes.json();
-    if (meta.error) { showToast('Error: ' + meta.error.message); return; }
+    if (meta.error) { showToast('Sheets API error: ' + meta.error.message); return; }
 
     const sheets = meta.sheets || [];
-    showToast(`Found ${sheets.length} tabs — loading all...`);
+    if (!sheets.length) { showToast('No tabs found in spreadsheet.'); return; }
+    showToast(`Found ${sheets.length} tabs — loading...`);
 
-    // Load each tab in parallel
-    const results = await Promise.all(
-      sheets.map(sh => loadSingleSheet(sh.properties.title))
+    // Step 2: batchGet all tabs in one request using single-quoted names
+    // Single quotes handle spaces, accents, and special chars safely
+    const ranges = sheets.map(sh => "'" + sh.properties.title.replace(/'/g, "\\'") + "'!A1:Z500");
+    const rangeParams = ranges.map(r => 'ranges=' + encodeURIComponent(r)).join('&');
+
+    const batchRes = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchGet?${rangeParams}`,
+      { headers: { Authorization: 'Bearer ' + accessToken } }
     );
+    const batchData = await batchRes.json();
+    if (batchData.error) { showToast('Batch load error: ' + batchData.error.message); return; }
 
-    // Merge and assign unique IDs
+    // Step 3: parse each tab
     let id = 0;
-    results.forEach(rows => rows.forEach(s => { s.id = id++; sources.push(s); }));
+    (batchData.valueRanges || []).forEach((vr, i) => {
+      const tabName = sheets[i].properties.title;
+      const rows = vr.values || [];
+      if (rows.length < 2) return;
+      const parsed = parseTab(rows, tabName);
+      parsed.forEach(s => { s.id = id++; sources.push(s); });
+    });
 
     showToast(`Loaded ${sources.length} sources across ${sheets.length} tabs`);
     renderAll();
 
   } catch (e) {
     showToast('Failed to load sheets: ' + e.message);
-  }
-}
-
-async function loadSingleSheet(sheetName) {
-  try {
-    const encoded = encodeURIComponent(sheetName);
-    const res = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encoded}!A1:Z500`,
-      { headers: { Authorization: 'Bearer ' + accessToken } }
-    );
-    const data = await res.json();
-    if (data.error || !data.values || data.values.length < 2) return [];
-    return parseTab(data.values, sheetName);
-  } catch {
-    return [];
   }
 }
 
